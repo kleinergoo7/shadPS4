@@ -643,6 +643,7 @@ bool EmulatorSettingsImpl::TransferSettings() {
         setFromToml(s.renderdoc_enabled, vk, "rdocEnable");
         setFromToml(s.pipeline_cache_enabled, vk, "pipelineCacheEnable");
         setFromToml(s.pipeline_cache_archived, vk, "pipelineCacheArchive");
+        setFromToml(s.gpu_clock_frame_us, vk, "gpuClockFrameUs");
     }
 
     if (og_data.contains("Debug")) {
