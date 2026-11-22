@@ -9,6 +9,8 @@
 #include "common/bit_field.h"
 #include "common/types.h"
 #include "common/uint128.h"
+#include "core/debug_state.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/gnmdriver/gnmdriver.h"
 #include "core/libraries/kernel/time.h"
 #include "video_core/amdgpu/pm4_opcodes.h"
@@ -339,11 +341,45 @@ enum class InterruptSelect : u32 {
     IrqUndocumented = 3,
 };
 
+struct FrameLockedGpuClock {
+    u64 offset{};
+    u64 last_value{};
+    u64 events{};
+    u64 last_frame{};
+    bool active{};
+
+    u64 operator()(u64 host_value, u32 frame_us, u64 ticks_per_us) {
+        if (frame_us == 0) {
+            if (active) {
+                active = false;
+                offset = last_value - host_value;
+            }
+            last_value = host_value + offset;
+            return last_value;
+        }
+        const u64 frame = DebugState.GetFrameNum();
+        if (!active) {
+            active = true;
+            last_frame = frame;
+            events = 0;
+            offset = last_value;
+        } else if (frame != last_frame) {
+            offset += (frame - last_frame) * u64{frame_us} * ticks_per_us;
+            last_frame = frame;
+            events = 0;
+        }
+        ++events;
+        last_value = offset + events * ticks_per_us;
+        return last_value;
+    }
+};
+
 static u64 GetGpuClock64() {
     auto now = std::chrono::high_resolution_clock::now();
     auto duration = now.time_since_epoch();
     auto ticks = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
-    return static_cast<u64>(ticks);
+    static FrameLockedGpuClock locked;
+    return locked(static_cast<u64>(ticks), EmulatorSettings.GetGpuClockFrameUs(), 1000);
 }
 
 static u64 GetGpuPerfCounter() {
@@ -352,8 +388,8 @@ static u64 GetGpuPerfCounter() {
 
     const auto cpu_cycles = Libraries::Kernel::sceKernelReadTsc();
     const auto gpu_cycles = Common::MultiplyAndDivide64(cpu_cycles, gpu_freq, cpu_freq);
-
-    return gpu_cycles;
+    static FrameLockedGpuClock locked;
+    return locked(gpu_cycles, EmulatorSettings.GetGpuClockFrameUs(), gpu_freq / 1'000'000);
 }
 
 // VGT_EVENT_INITIATOR.EVENT_TYPE
