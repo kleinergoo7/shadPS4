@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <unordered_map>
 #include "common/alignment.h"
 #include "common/arch.h"
 #include "common/assert.h"
@@ -33,6 +34,73 @@
 #endif
 
 namespace Core {
+
+/* --- JSC call-level tracing (SHAD_JSC_TRACE=1) ----------------------------------------------
+ * Wrappers with known JSC C signatures. shadPS4 runs guest code natively, so returning a host
+ * function pointer from Resolve works the same as for HLE symbols. Each wrapper logs and calls
+ * the real export, whose address is captured when it is resolved. */
+namespace {
+using JsGetUtf8 = size_t (*)(void*, char*, size_t);
+using JsEval = void* (*)(void*, void*, void*, void*, int, void**);
+using JsToString = void* (*)(void*, void*, void**);
+using JsMakeFunc = void* (*)(void*, void*, void*);
+using JsGetType = int (*)(void*);
+JsGetUtf8 g_js_utf8;
+JsEval g_js_eval;
+JsToString g_js_tostring;
+JsMakeFunc g_js_makefunc;
+JsGetType g_js_gettype;
+std::unordered_map<u64, u64> g_jsc_wrapper_to_real;
+
+void LogJscString(const char* label, void* s) {
+    if (!s || !g_js_utf8) return;
+    char buf[256] = {0};
+    g_js_utf8(s, buf, sizeof(buf) - 1);
+    LOG_INFO(Core_Linker, "JSCALL {} '{}'", label, buf);
+}
+
+PS4_SYSV_ABI void* TraceJsEval(void* ctx, void* script, void* thisobj, void* url, int line, void** exc) {
+    if (!g_js_eval) return nullptr;
+    void* r = g_js_eval(ctx, script, thisobj, url, line, exc);
+    LOG_INFO(Core_Linker, "JSCALL JSEvaluateScript -> {} exc={} line={}", fmt::ptr(r),
+             exc ? fmt::ptr(*exc) : "null", line);
+    LogJscString("  script", script);
+    return r;
+}
+PS4_SYSV_ABI void* TraceJsToString(void* ctx, void* value, void** exc) {
+    if (!g_js_tostring) return nullptr;
+    void* r = g_js_tostring(ctx, value, exc);
+    LogJscString("  ToString", r);
+    return r;
+}
+using JsCallAsFunc = void* (*)(void*, void*, void*, size_t, void**, void**);
+void* g_real_callback;
+PS4_SYSV_ABI void* TraceHandleCall(void* ctx, void* function, void* self, size_t argc,
+                                   void** argv, void** exc) {
+    if (argc >= 1 && argv && argv[0] && g_js_tostring) {
+        void* s = g_js_tostring(ctx, argv[0], nullptr);
+        LogJscString("HANDLECALL arg0", s);
+    }
+    void* r = nullptr;
+    if (g_real_callback) {
+        r = reinterpret_cast<JsCallAsFunc>(g_real_callback)(ctx, function, self, argc, argv, exc);
+    }
+    LOG_INFO(Core_Linker, "JSCALL HANDLECALL -> {} exc={} argc={}", fmt::ptr(r),
+             exc ? fmt::ptr(*exc) : "null", argc);
+    if (r && g_js_tostring) {
+        void* s = g_js_tostring(ctx, r, nullptr);
+        LogJscString("  RETVAL", s);
+    }
+    return r;
+}
+PS4_SYSV_ABI void* TraceJsMakeFunc(void* ctx, void* name, void* fn) {
+    if (!g_js_makefunc) return nullptr;
+    LogJscString("  MakeFunc", name);
+    LOG_INFO(Core_Linker, "JSCALL JSObjectMakeFunctionWithCallback fn={}", fmt::ptr(fn));
+    g_real_callback = fn;
+    return g_js_makefunc(ctx, name, reinterpret_cast<void*>(&TraceHandleCall));
+}
+} // namespace
 
 static PS4_SYSV_ABI void ProgramExitFunc() {
     LOG_ERROR(Core_Linker, "Exit function called");
@@ -435,6 +503,25 @@ bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Modul
         record = mod->export_sym.FindSymbol(sr);
         if (record) {
             *return_info = *record;
+            if (std::getenv("SHAD_JSC_TRACE") &&
+                (library->name.find("JavaScriptCore") != std::string::npos ||
+                 library->name.find("EAWebKit") != std::string::npos ||
+                 library->name.find("Twinkle") != std::string::npos)) {
+                LOG_INFO(Core_Linker, "JSC_EXPORT {} lib={} mod={} addr={:#x}", sr.name,
+                         library->name, module->name, record->virtual_address);
+                if (sr.name == "YssF41MWxCU") {
+                    g_js_eval = reinterpret_cast<JsEval>(record->virtual_address);
+                    return_info->virtual_address = reinterpret_cast<u64>(&TraceJsEval);
+                } else if (sr.name == "NqV8ddwLaiY") {
+                    g_js_utf8 = reinterpret_cast<JsGetUtf8>(record->virtual_address);
+                } else if (sr.name == "9bSDYmkp-Vw") {
+                    g_js_tostring = reinterpret_cast<JsToString>(record->virtual_address);
+                    return_info->virtual_address = reinterpret_cast<u64>(&TraceJsToString);
+                } else if (sr.name == "Tm9bXhmwlMA") {
+                    g_js_makefunc = reinterpret_cast<JsMakeFunc>(record->virtual_address);
+                    return_info->virtual_address = reinterpret_cast<u64>(&TraceJsMakeFunc);
+                }
+            }
             return true;
         }
     }
